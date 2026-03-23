@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import Redis from 'ioredis';
 import { WATCHED_WALLETS } from './wallets.js';
 import { sendDiscordAlert } from './discord.js';
 
@@ -7,14 +8,47 @@ const app = express();
 app.use(express.json());
 
 const WSOL = 'So11111111111111111111111111111111111111112';
-
-// tokenMint → { buys: Map<walletAddress, { solAmount, timestamp }>, alerted: boolean }
-const tokenBuys = new Map();
-
-const WINDOW_MS = 24 * 60 * 60 * 1000;   // 24h rolling window
+const WINDOW_MS = 24 * 60 * 60 * 1000;
 const ALERT_THRESHOLD = 3;
 
-// Parse a Helius Enhanced Transaction into { walletAddress, tokenMint, solAmount } or null
+// Redis keys
+const ALERTED_KEY = 'insider:alerted';                     // Set of minted tokens already alerted
+const buyKey = mint => `insider:buys:${mint}`;             // Hash: wallet → JSON({solAmount,timestamp})
+
+const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+redis.on('error', err => console.error('[redis] error:', err.message));
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+async function hasAlerted(mint) {
+  return redis.sismember(ALERTED_KEY, mint).then(r => r === 1);
+}
+
+async function recordBuy(mint, wallet, solAmount) {
+  const key = buyKey(mint);
+  await redis.hset(key, wallet, JSON.stringify({ solAmount, timestamp: Date.now() }));
+  await redis.expire(key, 26 * 60 * 60); // 26h TTL — auto-cleanup
+}
+
+async function getActiveBuys(mint) {
+  const key = buyKey(mint);
+  const all = await redis.hgetall(key);
+  if (!all) return [];
+
+  const cutoff = Date.now() - WINDOW_MS;
+  const active = [];
+
+  for (const [wallet, raw] of Object.entries(all)) {
+    const data = JSON.parse(raw);
+    if (data.timestamp >= cutoff) {
+      active.push({ wallet, ...data });
+    }
+  }
+  return active;
+}
+
+// ── swap parser ───────────────────────────────────────────────────────────────
+
 function parseSwap(tx) {
   if (!tx?.feePayer) return null;
 
@@ -24,24 +58,18 @@ function parseSwap(tx) {
 
   const swapEvent = tx.events?.swap;
   if (swapEvent) {
-    // SOL → Token (buy)
     if (swapEvent.nativeInput && swapEvent.tokenOutputs?.length > 0) {
       solAmount = parseInt(swapEvent.nativeInput.amount || '0') / 1e9;
       const out = swapEvent.tokenOutputs.find(t => t.mint && t.mint !== WSOL);
       tokenMint = out?.mint || null;
-    }
-    // Token → SOL (sell) — skip
-    else if (swapEvent.nativeOutput && swapEvent.tokenInputs?.length > 0) {
-      return null;
-    }
-    // Token → Token — look at what feePayer received
-    else if (swapEvent.tokenOutputs?.length > 0) {
+    } else if (swapEvent.nativeOutput && swapEvent.tokenInputs?.length > 0) {
+      return null; // sell
+    } else if (swapEvent.tokenOutputs?.length > 0) {
       const out = swapEvent.tokenOutputs.find(t => t.mint && t.mint !== WSOL);
       tokenMint = out?.mint || null;
     }
   }
 
-  // Fallback: check tokenTransfers
   if (!tokenMint) {
     const received = (tx.tokenTransfers || []).find(
       t => t.toUserAccount === walletAddress && t.mint && t.mint !== WSOL
@@ -51,13 +79,11 @@ function parseSwap(tx) {
 
   if (!tokenMint) return null;
 
-  // Confirm feePayer actually received this token
   const tokenReceived = (tx.tokenTransfers || []).some(
     t => t.toUserAccount === walletAddress && t.mint === tokenMint
   );
   if (!tokenReceived) return null;
 
-  // Calculate SOL spent if not from swap event
   if (solAmount <= 0) {
     const spent = (tx.nativeTransfers || [])
       .filter(t => t.fromUserAccount === walletAddress)
@@ -72,47 +98,32 @@ function parseSwap(tx) {
   };
 }
 
-function pruneOldBuys(entry) {
-  const cutoff = Date.now() - WINDOW_MS;
-  for (const [wallet, data] of entry.buys) {
-    if (data.timestamp < cutoff) entry.buys.delete(wallet);
-  }
-}
+// ── core logic ────────────────────────────────────────────────────────────────
 
-async function handleSwap(swap) {
-  const { walletAddress, tokenMint, solAmount } = swap;
-
+async function handleSwap({ walletAddress, tokenMint, solAmount }) {
   if (!WATCHED_WALLETS.has(walletAddress)) return;
 
-  if (!tokenBuys.has(tokenMint)) {
-    tokenBuys.set(tokenMint, { buys: new Map(), alerted: false });
-  }
+  // Already alerted for this token — never ping again
+  if (await hasAlerted(tokenMint)) return;
 
-  const entry = tokenBuys.get(tokenMint);
+  await recordBuy(tokenMint, walletAddress, solAmount);
 
-  // Already fired for this token — never alert again
-  if (entry.alerted) return;
+  const activeBuys = await getActiveBuys(tokenMint);
+  const count = activeBuys.length;
 
-  pruneOldBuys(entry);
-
-  // Record this wallet's buy (overwrite if already bought — counts once per wallet)
-  entry.buys.set(walletAddress, { solAmount, timestamp: Date.now() });
-
-  const count = entry.buys.size;
   console.log(`[tracker] ${walletAddress.slice(0, 6)}... bought ${tokenMint.slice(0, 6)}... (${solAmount} SOL) — ${count}/${WATCHED_WALLETS.size} insiders`);
 
   if (count < ALERT_THRESHOLD) return;
 
-  entry.alerted = true;
-
-  const buyers = Array.from(entry.buys.entries()).map(([wallet, data]) => ({
-    wallet,
-    solAmount: data.solAmount,
-  }));
+  // Double-check race condition — mark before sending
+  const added = await redis.sadd(ALERTED_KEY, tokenMint);
+  if (added === 0) return; // another request already marked it
 
   console.log(`[alert] 🚨 ${count} insiders bought ${tokenMint} — firing Discord alert`);
-  await sendDiscordAlert({ tokenMint, buyers, totalWatched: WATCHED_WALLETS.size });
+  await sendDiscordAlert({ tokenMint, buyers: activeBuys, totalWatched: WATCHED_WALLETS.size });
 }
+
+// ── routes ────────────────────────────────────────────────────────────────────
 
 app.post('/webhook', async (req, res) => {
   res.status(200).json({ ok: true });
@@ -129,8 +140,9 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', tracked: tokenBuys.size, wallets: WATCHED_WALLETS.size });
+app.get('/health', async (_req, res) => {
+  const alertedCount = await redis.scard(ALERTED_KEY).catch(() => -1);
+  res.json({ status: 'ok', wallets: WATCHED_WALLETS.size, alertedTokens: alertedCount });
 });
 
 const PORT = process.env.PORT || 3000;
