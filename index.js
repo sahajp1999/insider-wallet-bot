@@ -8,12 +8,11 @@ app.use(express.json());
 
 const WSOL = 'So11111111111111111111111111111111111111112';
 
-// tokenMint → { buys: Map<walletAddress, { solAmount, timestamp }>, lastAlertAt: number|null }
+// tokenMint → { buys: Map<walletAddress, { solAmount, timestamp }>, alerted: boolean }
 const tokenBuys = new Map();
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;   // 24h rolling window
 const ALERT_THRESHOLD = 3;
-const COOLDOWN_MS = 6 * 60 * 60 * 1000;  // 6h cooldown before re-alerting same token
 
 // Parse a Helius Enhanced Transaction into { walletAddress, tokenMint, solAmount } or null
 function parseSwap(tx) {
@@ -86,10 +85,14 @@ async function handleSwap(swap) {
   if (!WATCHED_WALLETS.has(walletAddress)) return;
 
   if (!tokenBuys.has(tokenMint)) {
-    tokenBuys.set(tokenMint, { buys: new Map(), lastAlertAt: null });
+    tokenBuys.set(tokenMint, { buys: new Map(), alerted: false });
   }
 
   const entry = tokenBuys.get(tokenMint);
+
+  // Already fired for this token — never alert again
+  if (entry.alerted) return;
+
   pruneOldBuys(entry);
 
   // Record this wallet's buy (overwrite if already bought — counts once per wallet)
@@ -100,13 +103,7 @@ async function handleSwap(swap) {
 
   if (count < ALERT_THRESHOLD) return;
 
-  const now = Date.now();
-  if (entry.lastAlertAt && now - entry.lastAlertAt < COOLDOWN_MS) {
-    console.log(`[tracker] Cooldown active for ${tokenMint.slice(0, 8)}... — skipping alert`);
-    return;
-  }
-
-  entry.lastAlertAt = now;
+  entry.alerted = true;
 
   const buyers = Array.from(entry.buys.entries()).map(([wallet, data]) => ({
     wallet,
