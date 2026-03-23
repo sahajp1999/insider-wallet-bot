@@ -6,7 +6,6 @@ import { sendDiscordAlert } from './discord.js';
 const app = express();
 app.use(express.json());
 
-const WEBHOOK_SECRET = process.env.HELIUS_WEBHOOK_SECRET;
 const WSOL = 'So11111111111111111111111111111111111111112';
 
 // tokenMint → { buys: Map<walletAddress, { solAmount, timestamp }>, lastAlertAt: number|null }
@@ -120,14 +119,6 @@ async function handleSwap(swap) {
 
 app.post('/webhook', async (req, res) => {
   res.status(200).json({ ok: true });
-
-  if (WEBHOOK_SECRET) {
-    const auth = req.headers['authorization'];
-    if (auth !== WEBHOOK_SECRET) {
-      console.warn('[webhook] Rejected — bad authorization header');
-      return;
-    }
-  }
 
   const txs = Array.isArray(req.body) ? req.body : [];
   for (const tx of txs) {
