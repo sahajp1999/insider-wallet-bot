@@ -67,6 +67,11 @@ function parseSwap(tx) {
     } else if (swapEvent.tokenOutputs?.length > 0) {
       const out = swapEvent.tokenOutputs.find(t => t.mint && t.mint !== WSOL);
       tokenMint = out?.mint || null;
+      // SOL was wrapped to WSOL before the swap — use WSOL input as the real SOL amount
+      const wsolInput = swapEvent.tokenInputs?.find(t => t.mint === WSOL);
+      if (wsolInput) {
+        solAmount = parseInt(wsolInput.amount || '0') / 1e9;
+      }
     }
   }
 
