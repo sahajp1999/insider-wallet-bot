@@ -47,6 +47,23 @@ async function getActiveBuys(mint) {
   return active;
 }
 
+// ── market cap ────────────────────────────────────────────────────────────────
+
+async function fetchMarketCap(mint) {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+    const data = await res.json();
+    const pairs = data?.pairs;
+    if (!pairs?.length) return null;
+    const best = pairs.reduce((a, b) =>
+      ((b.liquidity?.usd || 0) > (a.liquidity?.usd || 0) ? b : a)
+    );
+    return best.marketCap || best.fdv || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── swap parser ───────────────────────────────────────────────────────────────
 
 function parseSwap(tx) {
@@ -125,7 +142,8 @@ async function handleSwap({ walletAddress, tokenMint, solAmount }) {
   if (added === 0) return; // another request already marked it
 
   console.log(`[alert] 🚨 ${count} insiders bought ${tokenMint} — firing Discord alert`);
-  await sendDiscordAlert({ tokenMint, buyers: activeBuys, totalWatched: WATCHED_WALLETS.size });
+  const marketCap = await fetchMarketCap(tokenMint);
+  await sendDiscordAlert({ tokenMint, buyers: activeBuys, totalWatched: WATCHED_WALLETS.size, marketCap });
 }
 
 // ── routes ────────────────────────────────────────────────────────────────────

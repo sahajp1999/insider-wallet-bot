@@ -4,7 +4,7 @@ function short(address) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-export async function sendDiscordAlert({ tokenMint, buyers, totalWatched }) {
+export async function sendDiscordAlert({ tokenMint, buyers, totalWatched, marketCap }) {
   if (!WEBHOOK_URL) {
     console.log('[discord] No webhook URL set — skipping');
     return;
@@ -14,6 +14,10 @@ export async function sendDiscordAlert({ tokenMint, buyers, totalWatched }) {
     .map((b, i) => `${i + 1}. \`${short(b.wallet)}\` — **${b.solAmount} SOL**`)
     .join('\n');
 
+  const mcapStr = marketCap != null
+    ? `$${Number(marketCap).toLocaleString('en-US', { maximumFractionDigits: 0 })}`
+    : 'Unknown';
+
   const embed = {
     title: `🚨 ${buyers.length}/${totalWatched} Insiders Buying`,
     color: 0xFF4500,
@@ -22,6 +26,11 @@ export async function sendDiscordAlert({ tokenMint, buyers, totalWatched }) {
         name: '👛 Wallets',
         value: buyerLines,
         inline: false,
+      },
+      {
+        name: '📊 Market Cap',
+        value: mcapStr,
+        inline: true,
       },
       {
         name: '🔗 Links',
